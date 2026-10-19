@@ -99,26 +99,32 @@ def inventory(tables):
     return out
 
 
-def scan(tables, units):
-    """labels, stories, combos and what is already known (sections, Lu) from one model."""
+def scan(tables, units, gravity=None):
+    """labels, stories, combos and what is already known (sections, Lu, elevations) in one model."""
+    gn = gravity or E.GRAV_DEFAULT
+    allg = {E._norm(x): g for g, xs in gn.items() for x in xs}
     t, n = E.find_table(tables, 'Element Forces - Columns')
     forces = E.column_forces(tables, units, 'x') if t else []
     labels = sorted({f['label'] for f in forces}, key=lambda s: (len(s), s))
     stories = sorted({f['story'] for f in forces})
     combos = sorted({f['combo'] for f in forces if 'comb' in f['ctype'].lower() or not f['ctype'].strip()})
     cases = sorted({f['combo'] for f in forces} - set(combos))
-    fac, kind = E.combo_factors(tables)
+    fac, kind = E.combo_factors(tables, gn)
+    case_names = sorted({c for f in fac.values() for c in f}) or cases
     geo = E.geometry(tables, units)
     secs = E.sections(tables, units)
     order = E.story_order(geo) if geo else []
+    from_z = bool(order)
     if not order:
         from run import story_rank
         order = sorted(stories, key=story_rank)
     order = [s for s in order if s in stories] + [s for s in stories if s not in order]
-    L = {}
+    L, z = {}, {}
     for (lab, st), g in geo.items():
         if 'L' in g:
             L.setdefault(st, []).append(g['L'] / 100)
+        if 'zb' in g:
+            z[st] = (round(g['zb'] / 100, 3), round(g['zt'] / 100, 3))
     Lu = {st: round(statistics.median(v), 3) for st, v in L.items()}
     sec_of = {}
     for (lab, st), g in geo.items():
@@ -126,8 +132,10 @@ def scan(tables, units):
         d = (secs.get(s) or E.section_from_name(s)) if s else None
         if d:
             sec_of.setdefault(lab, set()).add((d['shape'], round(d['t2'] * 10), round(d['t3'] * 10), bool(d.get('assumed'))))
-    return dict(labels=labels, stories=order, combos=combos, cases=cases, defined=sorted(fac), kind=kind, Lu=Lu, sec_of=sec_of,
-                n_forces=len(forces))
+    has_cases = any(allg.get(E._norm(f['combo'])) for f in forces)
+    return dict(labels=labels, stories=order, combos=combos, cases=cases, case_names=case_names, defined=sorted(fac), kind=kind,
+                Lu=Lu, z=z, sec_of=sec_of, sec_labels=set(sec_of), L_keys={k for k, g in geo.items() if 'L' in g},
+                order_from_z=from_z, has_gravity_cases=has_cases, n_forces=len(forces))
 
 
 def synth_combos(rows):
@@ -293,3 +301,50 @@ def dxf_png(path, dpi=200):
     fig.savefig(bio, format='png', dpi=dpi, facecolor='white')
     plt.close(fig)
     return bio.getvalue()
+
+
+# ------------------------------------------------------------------------------------------------ app pipeline (shared by UI and tests)
+def prepare(up, tpl):
+    """up: {'seismic'|'full_reduced'|'full_unreduced': (tables, units) or None}; tpl: inputs.read_template() dict."""
+    import inputs as INP
+    single = up.get('full_reduced') is None or up.get('seismic') is None
+    base = {'seismic': up.get('seismic') or up.get('full_reduced'), 'full_reduced': up.get('full_reduced') or up.get('seismic'),
+            'full_unreduced': up.get('full_unreduced')}
+    label_story = set()
+    for m in base.values():
+        if m:
+            label_story |= {(f['label'], f['story']) for f in E.column_forces(m[0], m[1], 'x')}
+    eff, rep = {}, []
+    for k, m in base.items():
+        if m is None:
+            eff[k] = None; continue
+        T, U, r = INP.apply(m[0], m[1], tpl, label_story)
+        eff[k] = (T, U); rep += [f'{k}: {x}' for x in r]
+    cfg = INP.to_cfg(tpl)
+    gn = cfg['gravity_cases']
+    scS, scR = scan(*eff['seismic'], gravity=gn), scan(*eff['full_reduced'], gravity=gn)
+    labels = sorted({l for l, s in label_story}, key=lambda s: (len(s), s))
+    stories = cfg['story_order'] or (scR['stories'] + [s for s in scS['stories'] if s not in scR['stories']])
+    combos = sorted(set(scS['combos']) | set(scR['combos']))
+    undefined = [c for c in combos if c not in set(scS['defined']) | set(scR['defined'])]
+    found = dict(labels=labels, stories=stories, combos=combos, undefined=undefined or combos, undefined_only=undefined,
+                 cases=scR['case_names'] or scS['case_names'], sec_of={**scS['sec_of'], **scR['sec_of']}, z={**scS['z'], **scR['z']})
+    return dict(single=single, eff=eff, merge_rep=rep, cfg_tpl=cfg, scS=scS, scR=scR, labels=labels, stories=stories,
+                combos=combos, undefined=undefined, found=found, label_story=label_story)
+
+
+def build_cfg(prep, workdir):
+    import inputs as INP
+    paths = {}
+    for k, fn in (('seismic', 'seismic.xlsx'), ('full_reduced', 'full_reduced.xlsx'), ('full_unreduced', 'full_unreduced.xlsx')):
+        if prep['eff'][k]:
+            write_tables(os.path.join(workdir, fn), *prep['eff'][k]); paths[k] = fn
+    cfg = json.loads(json.dumps(prep['cfg_tpl']))
+    if not cfg['lap_table']:
+        cfg['lap_table'] = {str(f): {str(d): v for d, v in t.items()} for f, t in INP.LAP_KNOWN.items()}
+    cfg['inputs'] = paths
+    if not prep['single']:
+        cfg['basement_stories'] = []
+    if not cfg['story_order']:
+        cfg['story_order'] = prep['stories']
+    return cfg
