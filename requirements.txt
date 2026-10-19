@@ -1,8 +1,0 @@
-streamlit>=1.50
-numpy
-scipy
-pandas
-plotly
-matplotlib
-openpyxl
-ezdxf>=1.3
